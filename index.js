@@ -4,28 +4,13 @@ const express = require('express');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcrypt');
-const session = require('express-session');
 const db = require('./database');
 
 const pendingDiscordLogins = new Map();
 const app = express();
 
-const app = express();
-
-app.set('trust proxy', 1);
-
 app.use(cors());
-
-app.use(session({
-    secret: process.env.SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-        maxAge: 10 * 60 * 1000,
-        sameSite: 'lax',
-        secure: true
-    }
-}));
+app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
@@ -37,7 +22,6 @@ const DISCORD_REQUIRED_ROLE_ID = process.env.DISCORD_REQUIRED_ROLE_ID;
 
 function hasRequiredEnvironmentVariables() {
     return Boolean(
-        process.env.SESSION_SECRET &&
         DISCORD_CLIENT_ID &&
         DISCORD_CLIENT_SECRET &&
         DISCORD_REDIRECT_URI &&
@@ -54,10 +38,14 @@ app.get('/healthz', (req, res) => {
     res.status(200).send('ok');
 });
 
+// A app abre este endpoint no browser.
 app.get('/api/discord/login/:requestId', (req, res) => {
     if (!hasRequiredEnvironmentVariables()) {
-        console.error('Faltam variáveis de ambiente do Discord ou SESSION_SECRET.');
-        return res.status(500).send('A API não está configurada corretamente.');
+        console.error('Faltam variáveis de ambiente do Discord.');
+
+        return res.status(500).send(
+            'A API não está configurada corretamente.'
+        );
     }
 
     const requestId = req.params.requestId;
@@ -68,10 +56,17 @@ app.get('/api/discord/login/:requestId', (req, res) => {
 
     const state = uuidv4();
 
-    req.session.discordState = state;
-    req.session.discordRequestId = requestId;
+    // Guarda state e requestId no servidor.
+    // Não depende de cookies nem de express-session.
+    pendingDiscordLogins.set(requestId, {
+        state: state,
+        status: 'pending',
+        expiresAt: Date.now() + (10 * 60 * 1000)
+    });
 
-    const scope = encodeURIComponent('identify guilds guilds.members.read');
+    const scope = encodeURIComponent(
+        'identify guilds guilds.members.read'
+    );
 
     const url =
         'https://discord.com/oauth2/authorize' +
@@ -84,16 +79,37 @@ app.get('/api/discord/login/:requestId', (req, res) => {
     return res.redirect(url);
 });
 
+// Discord volta aqui depois de o utilizador autorizar.
 app.get('/api/discord/callback', async (req, res) => {
     try {
         const { code, state, error } = req.query;
 
         if (error) {
-            return res.status(400).send('Autorização Discord cancelada ou recusada.');
+            return res.status(400).send(
+                'Autorização Discord cancelada ou recusada.'
+            );
         }
 
-        if (!code || !state || state !== req.session.discordState) {
-            return res.status(400).send('Pedido Discord inválido ou expirado.');
+        // Procura o pedido pendente cujo state coincide com o devolvido
+        // pelo Discord.
+        const loginEntry = [...pendingDiscordLogins.entries()]
+            .find(([, login]) => login.state === state);
+
+        if (!code || !state || !loginEntry) {
+            return res.status(400).send(
+                'Pedido Discord inválido ou expirado.'
+            );
+        }
+
+        const requestId = loginEntry[0];
+        const pendingLogin = loginEntry[1];
+
+        if (Date.now() > pendingLogin.expiresAt) {
+            pendingDiscordLogins.delete(requestId);
+
+            return res.status(400).send(
+                'Pedido Discord expirado. Volta à aplicação e tenta novamente.'
+            );
         }
 
         const tokenBody = new URLSearchParams({
@@ -119,7 +135,10 @@ app.get('/api/discord/callback', async (req, res) => {
 
         if (!tokenResponse.ok || !tokenData.access_token) {
             console.error('Erro ao obter token Discord:', tokenData);
-            return res.status(400).send('Não foi possível obter o token Discord.');
+
+            return res.status(400).send(
+                'Não foi possível obter o token Discord.'
+            );
         }
 
         const headers = {
@@ -132,7 +151,9 @@ app.get('/api/discord/callback', async (req, res) => {
         );
 
         if (!userResponse.ok) {
-            return res.status(400).send('Não foi possível obter o utilizador Discord.');
+            return res.status(400).send(
+                'Não foi possível obter o utilizador Discord.'
+            );
         }
 
         const user = await userResponse.json();
@@ -151,7 +172,9 @@ app.get('/api/discord/callback', async (req, res) => {
         }
 
         const member = await memberResponse.json();
-        const hasRequiredRole = Array.isArray(member.roles) &&
+
+        const hasRequiredRole =
+            Array.isArray(member.roles) &&
             member.roles.includes(DISCORD_REQUIRED_ROLE_ID);
 
         if (!hasRequiredRole) {
@@ -160,15 +183,10 @@ app.get('/api/discord/callback', async (req, res) => {
             );
         }
 
-        const requestId = req.session.discordRequestId;
-
-        if (!requestId) {
-            return res.status(400).send(
-                'Pedido de login expirado ou inválido. Volta à aplicação e tenta novamente.'
-            );
-        }
-
+        // Substitui o pedido pendente por um login autorizado.
+        // A aplicação C# vai encontrar este resultado no endpoint status.
         pendingDiscordLogins.set(requestId, {
+            status: 'authorized',
             discordId: user.id,
             username: user.username,
             expiresAt: Date.now() + (5 * 60 * 1000)
@@ -178,23 +196,27 @@ app.get('/api/discord/callback', async (req, res) => {
 <!doctype html>
 <html lang="pt-PT">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Discord validado</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Discord validado</title>
 </head>
 <body style="font-family: Arial, sans-serif; background: #111827; color: white; text-align: center; padding: 80px 20px;">
-  <h1>Discord validado com sucesso</h1>
-  <p>Podes fechar esta página e voltar à aplicação JonyOptimizer.</p>
-  <p>Utilizador: ${user.username}</p>
+    <h1>Discord validado com sucesso</h1>
+    <p>Podes fechar esta página e voltar à aplicação JonyOptimizer.</p>
+    <p>Utilizador: ${user.username}</p>
 </body>
 </html>
 `);
     } catch (error) {
         console.error('Erro Discord OAuth:', error);
-        return res.status(500).send('Erro ao validar o Discord.');
+
+        return res.status(500).send(
+            'Erro ao validar o Discord.'
+        );
     }
 });
 
+// A app C# consulta este endpoint a cada dois segundos.
 app.get('/api/discord/status/:requestId', (req, res) => {
     const requestId = req.params.requestId;
     const login = pendingDiscordLogins.get(requestId);
@@ -215,6 +237,13 @@ app.get('/api/discord/status/:requestId', (req, res) => {
         });
     }
 
+    if (login.status !== 'authorized') {
+        return res.json({
+            success: false,
+            status: 'pending'
+        });
+    }
+
     return res.json({
         success: true,
         status: 'authorized',
@@ -223,6 +252,7 @@ app.get('/api/discord/status/:requestId', (req, res) => {
     });
 });
 
+// Criar uma licença manualmente.
 app.post('/api/licenses/create', (req, res) => {
     try {
         const { discord_id, email, expires_at, max_devices = 1 } = req.body;
@@ -292,6 +322,7 @@ app.post('/api/licenses/create', (req, res) => {
     }
 });
 
+// Ativar uma licença num computador.
 app.post('/api/activate', (req, res) => {
     try {
         const { license_key, hwid } = req.body;
@@ -313,7 +344,10 @@ app.post('/api/activate', (req, res) => {
         let license = null;
 
         for (const currentLicense of licenses) {
-            if (bcrypt.compareSync(license_key, currentLicense.license_key_hash)) {
+            if (bcrypt.compareSync(
+                license_key,
+                currentLicense.license_key_hash
+            )) {
                 license = currentLicense;
                 break;
             }
@@ -366,6 +400,7 @@ app.post('/api/activate', (req, res) => {
         `).run(device.id);
 
         const sessionToken = uuidv4();
+
         const sessionExpiresAt = new Date(
             Date.now() + 7 * 24 * 60 * 60 * 1000
         ).toISOString();
@@ -402,6 +437,7 @@ app.post('/api/activate', (req, res) => {
     }
 });
 
+// Validar sessão existente.
 app.post('/api/validate', (req, res) => {
     try {
         const { hwid, session_token } = req.body;
