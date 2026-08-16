@@ -6,6 +6,7 @@ const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcrypt');
 const session = require('express-session');
 const db = require('./database');
+
 const pendingDiscordLogins = new Map();
 const app = express();
 
@@ -17,7 +18,9 @@ app.use(session({
     resave: false,
     saveUninitialized: false,
     cookie: {
-        maxAge: 10 * 60 * 1000 // 10 minutos
+        maxAge: 10 * 60 * 1000,
+        sameSite: 'lax',
+        secure: true
     }
 }));
 
@@ -29,13 +32,31 @@ const DISCORD_REDIRECT_URI = process.env.DISCORD_REDIRECT_URI;
 const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
 const DISCORD_REQUIRED_ROLE_ID = process.env.DISCORD_REQUIRED_ROLE_ID;
 
-// Página simples para confirmar no browser que a API está online.
+function hasRequiredEnvironmentVariables() {
+    return Boolean(
+        process.env.SESSION_SECRET &&
+        DISCORD_CLIENT_ID &&
+        DISCORD_CLIENT_SECRET &&
+        DISCORD_REDIRECT_URI &&
+        DISCORD_GUILD_ID &&
+        DISCORD_REQUIRED_ROLE_ID
+    );
+}
+
 app.get('/', (req, res) => {
     res.send('API de licenças JonyOptimizer está online.');
 });
 
-// Inicia um login Discord associado a esta abertura da app.
+app.get('/healthz', (req, res) => {
+    res.status(200).send('ok');
+});
+
 app.get('/api/discord/login/:requestId', (req, res) => {
+    if (!hasRequiredEnvironmentVariables()) {
+        console.error('Faltam variáveis de ambiente do Discord ou SESSION_SECRET.');
+        return res.status(500).send('A API não está configurada corretamente.');
+    }
+
     const requestId = req.params.requestId;
 
     if (!requestId || requestId.length < 10) {
@@ -60,7 +81,6 @@ app.get('/api/discord/login/:requestId', (req, res) => {
     return res.redirect(url);
 });
 
-// O Discord redireciona para aqui depois do login
 app.get('/api/discord/callback', async (req, res) => {
     try {
         const { code, state, error } = req.query;
@@ -70,7 +90,7 @@ app.get('/api/discord/callback', async (req, res) => {
         }
 
         if (!code || !state || state !== req.session.discordState) {
-            return res.status(400).send('Pedido Discord inválido.');
+            return res.status(400).send('Pedido Discord inválido ou expirado.');
         }
 
         const tokenBody = new URLSearchParams({
@@ -95,7 +115,7 @@ app.get('/api/discord/callback', async (req, res) => {
         const tokenData = await tokenResponse.json();
 
         if (!tokenResponse.ok || !tokenData.access_token) {
-            console.error(tokenData);
+            console.error('Erro ao obter token Discord:', tokenData);
             return res.status(400).send('Não foi possível obter o token Discord.');
         }
 
@@ -103,15 +123,17 @@ app.get('/api/discord/callback', async (req, res) => {
             Authorization: 'Bearer ' + tokenData.access_token
         };
 
-        // Perfil do utilizador
         const userResponse = await fetch(
             'https://discord.com/api/users/@me',
             { headers }
         );
 
+        if (!userResponse.ok) {
+            return res.status(400).send('Não foi possível obter o utilizador Discord.');
+        }
+
         const user = await userResponse.json();
 
-        // Membro no servidor (para obter roles)
         const memberResponse = await fetch(
             'https://discord.com/api/users/@me/guilds/' +
             DISCORD_GUILD_ID +
@@ -126,7 +148,8 @@ app.get('/api/discord/callback', async (req, res) => {
         }
 
         const member = await memberResponse.json();
-        const hasRequiredRole = member.roles.includes(DISCORD_REQUIRED_ROLE_ID);
+        const hasRequiredRole = Array.isArray(member.roles) &&
+            member.roles.includes(DISCORD_REQUIRED_ROLE_ID);
 
         if (!hasRequiredRole) {
             return res.status(403).send(
@@ -134,7 +157,6 @@ app.get('/api/discord/callback', async (req, res) => {
             );
         }
 
-        // Regista o login pendente com o ID gerado pela app.
         const requestId = req.session.discordRequestId;
 
         if (!requestId) {
@@ -150,26 +172,54 @@ app.get('/api/discord/callback', async (req, res) => {
         });
 
         return res.send(`
-  <html>
-    <body style="font-family: Arial; background: #111827; color: white; text-align: center; padding-top: 80px;">
-      <h1>Discord validado com sucesso</h1>
-      <p>Podes fechar esta página e voltar à aplicação JonyOptimizer.</p>
-      <p>Utilizador: ${user.username}</p>
-    </body>
-  </html>
+<!doctype html>
+<html lang="pt-PT">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Discord validado</title>
+</head>
+<body style="font-family: Arial, sans-serif; background: #111827; color: white; text-align: center; padding: 80px 20px;">
+  <h1>Discord validado com sucesso</h1>
+  <p>Podes fechar esta página e voltar à aplicação JonyOptimizer.</p>
+  <p>Utilizador: ${user.username}</p>
+</body>
+</html>
 `);
     } catch (error) {
         console.error('Erro Discord OAuth:', error);
-
-        return res.status(500).send(
-            'Erro ao validar o Discord.'
-        );
+        return res.status(500).send('Erro ao validar o Discord.');
     }
 });
 
+app.get('/api/discord/status/:requestId', (req, res) => {
+    const requestId = req.params.requestId;
+    const login = pendingDiscordLogins.get(requestId);
 
-// Criar uma licença manualmente.
-// Mais tarde este endpoint deve ser protegido por autenticação de administrador.
+    if (!login) {
+        return res.json({
+            success: false,
+            status: 'pending'
+        });
+    }
+
+    if (Date.now() > login.expiresAt) {
+        pendingDiscordLogins.delete(requestId);
+
+        return res.json({
+            success: false,
+            status: 'expired'
+        });
+    }
+
+    return res.json({
+        success: true,
+        status: 'authorized',
+        discordId: login.discordId,
+        username: login.username
+    });
+});
+
 app.post('/api/licenses/create', (req, res) => {
     try {
         const { discord_id, email, expires_at, max_devices = 1 } = req.body;
@@ -195,9 +245,9 @@ app.post('/api/licenses/create', (req, res) => {
             const userId = uuidv4();
 
             db.prepare(`
-        INSERT INTO users (id, discord_id, email)
-        VALUES (?, ?, ?)
-      `).run(userId, discord_id, email || null);
+                INSERT INTO users (id, discord_id, email)
+                VALUES (?, ?, ?)
+            `).run(userId, discord_id, email || null);
 
             user = {
                 id: userId,
@@ -209,10 +259,10 @@ app.post('/api/licenses/create', (req, res) => {
         const licenseId = uuidv4();
 
         db.prepare(`
-      INSERT INTO licenses
-      (id, license_key_hash, user_id, expires_at, max_devices)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(
+            INSERT INTO licenses
+            (id, license_key_hash, user_id, expires_at, max_devices)
+            VALUES (?, ?, ?, ?, ?)
+        `).run(
             licenseId,
             licenseKeyHash,
             user.id,
@@ -220,7 +270,7 @@ app.post('/api/licenses/create', (req, res) => {
             Number(max_devices) || 1
         );
 
-        console.log(`✅ Licença criada: ${licenseKey}`);
+        console.log(`Licença criada: ${licenseKey}`);
 
         return res.json({
             success: true,
@@ -230,7 +280,7 @@ app.post('/api/licenses/create', (req, res) => {
             max_devices: Number(max_devices) || 1
         });
     } catch (error) {
-        console.error('❌ Erro ao criar licença:', error);
+        console.error('Erro ao criar licença:', error);
 
         return res.status(500).json({
             success: false,
@@ -239,7 +289,6 @@ app.post('/api/licenses/create', (req, res) => {
     }
 });
 
-// Ativar uma licença num computador.
 app.post('/api/activate', (req, res) => {
     try {
         const { license_key, hwid } = req.body;
@@ -251,16 +300,13 @@ app.post('/api/activate', (req, res) => {
             });
         }
 
-        // Obtém as licenças que podem ser usadas.
         const licenses = db.prepare(`
-      SELECT *
-      FROM licenses
-      WHERE status = 'active'
-        AND expires_at > CURRENT_TIMESTAMP
-    `).all();
+            SELECT *
+            FROM licenses
+            WHERE status = 'active'
+              AND expires_at > CURRENT_TIMESTAMP
+        `).all();
 
-        // A chave está guardada como bcrypt hash.
-        // Por isso é necessário compará-la com bcrypt.compareSync.
         let license = null;
 
         for (const currentLicense of licenses) {
@@ -271,35 +317,29 @@ app.post('/api/activate', (req, res) => {
         }
 
         if (!license) {
-            console.log('❌ Tentativa com chave inválida.');
-
             return res.status(404).json({
                 valid: false,
                 reason: 'license_not_found'
             });
         }
 
-        // Verifica se este PC já está associado à licença.
         let device = db.prepare(`
-      SELECT *
-      FROM devices
-      WHERE license_id = ?
-        AND device_fingerprint = ?
-        AND status = 'active'
-    `).get(license.id, hwid);
+            SELECT *
+            FROM devices
+            WHERE license_id = ?
+              AND device_fingerprint = ?
+              AND status = 'active'
+        `).get(license.id, hwid);
 
-        // Se é um computador novo, confirma o limite de dispositivos.
         if (!device) {
             const activeDevices = db.prepare(`
-        SELECT COUNT(*) AS count
-        FROM devices
-        WHERE license_id = ?
-          AND status = 'active'
-      `).get(license.id);
+                SELECT COUNT(*) AS count
+                FROM devices
+                WHERE license_id = ?
+                  AND status = 'active'
+            `).get(license.id);
 
             if (activeDevices.count >= license.max_devices) {
-                console.log(`❌ Limite de dispositivos atingido: ${license.id}`);
-
                 return res.status(403).json({
                     valid: false,
                     reason: 'device_limit'
@@ -309,38 +349,35 @@ app.post('/api/activate', (req, res) => {
             const deviceId = uuidv4();
 
             db.prepare(`
-        INSERT INTO devices (id, license_id, device_fingerprint)
-        VALUES (?, ?, ?)
-      `).run(deviceId, license.id, hwid);
+                INSERT INTO devices (id, license_id, device_fingerprint)
+                VALUES (?, ?, ?)
+            `).run(deviceId, license.id, hwid);
 
             device = { id: deviceId };
         }
 
         db.prepare(`
-      UPDATE devices
-      SET last_seen = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(device.id);
+            UPDATE devices
+            SET last_seen = CURRENT_TIMESTAMP
+            WHERE id = ?
+        `).run(device.id);
 
-        // Cria uma sessão válida durante sete dias.
         const sessionToken = uuidv4();
         const sessionExpiresAt = new Date(
             Date.now() + 7 * 24 * 60 * 60 * 1000
         ).toISOString();
 
         db.prepare(`
-      INSERT INTO sessions
-      (id, user_id, device_id, token_hash, expires_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(
+            INSERT INTO sessions
+            (id, user_id, device_id, token_hash, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+        `).run(
             uuidv4(),
             license.user_id,
             device.id,
             sessionToken,
             sessionExpiresAt
         );
-
-        console.log(`✅ Licença ativada: ${license.id}`);
 
         return res.json({
             valid: true,
@@ -353,7 +390,7 @@ app.post('/api/activate', (req, res) => {
             }
         });
     } catch (error) {
-        console.error('❌ Erro de ativação:', error);
+        console.error('Erro de ativação:', error);
 
         return res.status(500).json({
             valid: false,
@@ -362,7 +399,6 @@ app.post('/api/activate', (req, res) => {
     }
 });
 
-// Validar sessão existente.
 app.post('/api/validate', (req, res) => {
     try {
         const { hwid, session_token } = req.body;
@@ -374,22 +410,22 @@ app.post('/api/validate', (req, res) => {
             });
         }
 
-        const session = db.prepare(`
-      SELECT
-        s.id AS session_id,
-        s.device_id,
-        l.status AS license_status,
-        l.expires_at AS license_expires_at
-      FROM sessions s
-      JOIN devices d ON d.id = s.device_id
-      JOIN licenses l ON l.id = d.license_id
-      WHERE s.token_hash = ?
-        AND s.expires_at > CURRENT_TIMESTAMP
-        AND d.device_fingerprint = ?
-        AND d.status = 'active'
-    `).get(session_token, hwid);
+        const activeSession = db.prepare(`
+            SELECT
+                s.id AS session_id,
+                s.device_id,
+                l.status AS license_status,
+                l.expires_at AS license_expires_at
+            FROM sessions s
+            JOIN devices d ON d.id = s.device_id
+            JOIN licenses l ON l.id = d.license_id
+            WHERE s.token_hash = ?
+              AND s.expires_at > CURRENT_TIMESTAMP
+              AND d.device_fingerprint = ?
+              AND d.status = 'active'
+        `).get(session_token, hwid);
 
-        if (!session) {
+        if (!activeSession) {
             return res.json({
                 valid: false,
                 reason: 'invalid_session',
@@ -398,8 +434,8 @@ app.post('/api/validate', (req, res) => {
         }
 
         if (
-            session.license_status !== 'active' ||
-            new Date(session.license_expires_at) <= new Date()
+            activeSession.license_status !== 'active' ||
+            new Date(activeSession.license_expires_at) <= new Date()
         ) {
             return res.json({
                 valid: false,
@@ -409,10 +445,10 @@ app.post('/api/validate', (req, res) => {
         }
 
         db.prepare(`
-      UPDATE devices
-      SET last_seen = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(session.device_id);
+            UPDATE devices
+            SET last_seen = CURRENT_TIMESTAMP
+            WHERE id = ?
+        `).run(activeSession.device_id);
 
         return res.json({
             valid: true,
@@ -422,7 +458,7 @@ app.post('/api/validate', (req, res) => {
             }
         });
     } catch (error) {
-        console.error('❌ Erro de validação:', error);
+        console.error('Erro de validação:', error);
 
         return res.status(500).json({
             valid: false,
@@ -430,40 +466,7 @@ app.post('/api/validate', (req, res) => {
         });
     }
 });
-app.get('/api/discord/status/:requestId', (req, res) => {
-    const login = pendingDiscordLogins.get(req.params.requestId);
 
-    if (!login) {
-        return res.json({
-            success: false,
-            status: 'pending'
-        });
-    }
-
-    if (Date.now() > login.expiresAt) {
-        pendingDiscordLogins.delete(req.params.requestId);
-
-        return res.json({
-            success: false,
-            status: 'expired'
-        });
-    }
-
-    return res.json({
-        success: true,
-        status: 'authorized',
-        discordId: login.discordId,
-        username: login.username
-    });
-});
 app.listen(PORT, () => {
-    console.log(`🚀 API a correr em http://localhost:${PORT}`);
-    console.log('📊 Endpoints disponíveis:');
-    console.log('   GET  /');
-    console.log('   GET  /api/discord/callback');
-    console.log('   GET  /api/discord/login/:requestId');
-    console.log('   GET  /api/discord/status/:requestId');
-    console.log('   POST /api/licenses/create');
-    console.log('   POST /api/activate');
-    console.log('   POST /api/validate');
+    console.log(`API a correr na porta ${PORT}`);
 });
