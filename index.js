@@ -7,12 +7,18 @@ const bcrypt = require('bcrypt');
 const db = require('./database');
 
 const pendingDiscordLogins = new Map();
+const discordTokenCooldowns = new Map();
 const app = express();
 
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+const DISCORD_TOKEN_URL = 'https://discord.com/api/oauth2/token';
+const DISCORD_USER_URL = 'https://discord.com/api/users/@me';
+const DISCORD_LOGIN_EXPIRY_MS = 10 * 60 * 1000;
+const DISCORD_AUTHORIZED_EXPIRY_MS = 5 * 60 * 1000;
+const DISCORD_TOKEN_COOLDOWN_MS = 30 * 1000;
 
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
@@ -39,20 +45,84 @@ function escapeHtml(value) {
         .replace(/'/g, '&#039;');
 }
 
+function getRetryAfterMs(response, body) {
+    const retryAfterHeader = response.headers.get('retry-after');
+
+    if (retryAfterHeader) {
+        const seconds = Number(retryAfterHeader);
+
+        if (Number.isFinite(seconds) && seconds > 0) {
+            return Math.ceil(seconds * 1000);
+        }
+    }
+
+    try {
+        const data = JSON.parse(body);
+        const retryAfterSeconds = Number(data.retry_after);
+
+        if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+            return Math.ceil(retryAfterSeconds * 1000);
+        }
+    } catch {
+        // A resposta pode não ser JSON, por exemplo um erro Cloudflare 1015.
+    }
+
+    return DISCORD_TOKEN_COOLDOWN_MS;
+}
+
+function getRemainingCooldownMs(requestId) {
+    const cooldownUntil = discordTokenCooldowns.get(requestId);
+
+    if (!cooldownUntil) {
+        return 0;
+    }
+
+    const remainingMs = cooldownUntil - Date.now();
+
+    if (remainingMs <= 0) {
+        discordTokenCooldowns.delete(requestId);
+        return 0;
+    }
+
+    return remainingMs;
+}
+
+function sendHtmlPage(res, status, title, heading, message) {
+    return res.status(status).send(`
+<!doctype html>
+<html lang="pt-PT">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${escapeHtml(title)}</title>
+</head>
+<body style="font-family: Arial, sans-serif; background: #111827; color: white; text-align: center; padding: 80px 20px;">
+    <h1>${escapeHtml(heading)}</h1>
+    <p>${escapeHtml(message)}</p>
+</body>
+</html>
+`);
+}
+
 async function readDiscordResponse(response, label) {
     const contentType = response.headers.get('content-type') || '';
     const body = await response.text();
 
     if (!response.ok) {
+        const error = new Error(`${label} devolveu HTTP ${response.status}`);
+        error.status = response.status;
+        error.retryAfterMs = response.status === 429
+            ? getRetryAfterMs(response, body)
+            : 0;
+
         console.error(`${label} falhou:`, {
             status: response.status,
             statusText: response.statusText,
             contentType,
+            retryAfterMs: error.retryAfterMs,
             body: body.substring(0, 1000)
         });
 
-        const error = new Error(`${label} devolveu HTTP ${response.status}`);
-        error.status = response.status;
         throw error;
     }
 
@@ -70,7 +140,7 @@ async function readDiscordResponse(response, label) {
 
     try {
         return JSON.parse(body);
-    } catch (parseError) {
+    } catch {
         console.error(`${label} devolveu JSON inválido:`, {
             status: response.status,
             contentType,
@@ -83,6 +153,25 @@ async function readDiscordResponse(response, label) {
     }
 }
 
+function cleanupExpiredDiscordLogins() {
+    const now = Date.now();
+
+    for (const [requestId, login] of pendingDiscordLogins.entries()) {
+        if (now > login.expiresAt) {
+            pendingDiscordLogins.delete(requestId);
+            discordTokenCooldowns.delete(requestId);
+        }
+    }
+
+    for (const [requestId, cooldownUntil] of discordTokenCooldowns.entries()) {
+        if (now >= cooldownUntil) {
+            discordTokenCooldowns.delete(requestId);
+        }
+    }
+}
+
+setInterval(cleanupExpiredDiscordLogins, 60 * 1000).unref();
+
 app.get('/', (req, res) => {
     res.send('API de licenças JonyOptimizer está online.');
 });
@@ -91,7 +180,7 @@ app.get('/healthz', (req, res) => {
     res.status(200).send('ok');
 });
 
-// A app abre este endpoint no browser.
+// A app abre este endpoint uma única vez por tentativa de login.
 app.get('/api/discord/login/:requestId', (req, res) => {
     if (!hasRequiredEnvironmentVariables()) {
         console.error('Faltam variáveis de ambiente do Discord.');
@@ -112,8 +201,10 @@ app.get('/api/discord/login/:requestId', (req, res) => {
     pendingDiscordLogins.set(requestId, {
         state,
         status: 'pending',
-        expiresAt: Date.now() + (10 * 60 * 1000)
+        expiresAt: Date.now() + DISCORD_LOGIN_EXPIRY_MS
     });
+
+    discordTokenCooldowns.delete(requestId);
 
     const scope = encodeURIComponent(
         'identify guilds guilds.members.read'
@@ -132,22 +223,32 @@ app.get('/api/discord/login/:requestId', (req, res) => {
 
 // Discord volta aqui depois de o utilizador autorizar.
 app.get('/api/discord/callback', async (req, res) => {
+    let requestId = null;
+
     try {
         const { code, state, error } = req.query;
 
         if (error) {
             console.error('Discord recusou ou cancelou a autorização:', error);
 
-            return res.status(400).send(
-                'Autorização Discord cancelada ou recusada.'
+            return sendHtmlPage(
+                res,
+                400,
+                'Autorização cancelada',
+                'Autorização Discord cancelada',
+                'Volta à aplicação e tenta novamente quando estiveres pronto.'
             );
         }
 
         if (!hasRequiredEnvironmentVariables()) {
             console.error('Faltam variáveis de ambiente do Discord.');
 
-            return res.status(500).send(
-                'A API não está configurada corretamente.'
+            return sendHtmlPage(
+                res,
+                500,
+                'Configuração inválida',
+                'A API não está configurada',
+                'Contacta o administrador da aplicação.'
             );
         }
 
@@ -155,21 +256,57 @@ app.get('/api/discord/callback', async (req, res) => {
             .find(([, login]) => login.state === state);
 
         if (!code || !state || !loginEntry) {
-            return res.status(400).send(
-                'Pedido Discord inválido ou expirado.'
+            return sendHtmlPage(
+                res,
+                400,
+                'Pedido inválido',
+                'Pedido Discord inválido ou expirado',
+                'Volta à aplicação e inicia um novo login.'
             );
         }
 
-        const requestId = loginEntry[0];
+        requestId = loginEntry[0];
         const pendingLogin = loginEntry[1];
 
         if (Date.now() > pendingLogin.expiresAt) {
             pendingDiscordLogins.delete(requestId);
+            discordTokenCooldowns.delete(requestId);
 
-            return res.status(400).send(
-                'Pedido Discord expirado. Volta à aplicação e tenta novamente.'
+            return sendHtmlPage(
+                res,
+                400,
+                'Pedido expirado',
+                'Pedido Discord expirado',
+                'Volta à aplicação e tenta novamente.'
             );
         }
+
+        if (pendingLogin.status === 'processing') {
+            return sendHtmlPage(
+                res,
+                409,
+                'Pedido em processamento',
+                'Este login já está a ser validado',
+                'Aguarda alguns segundos e volta à aplicação.'
+            );
+        }
+
+        const cooldownMs = getRemainingCooldownMs(requestId);
+
+        if (cooldownMs > 0) {
+            const seconds = Math.ceil(cooldownMs / 1000);
+
+            return sendHtmlPage(
+                res,
+                429,
+                'Aguarda antes de tentar',
+                'O Discord limitou temporariamente os pedidos',
+                `Aguarda cerca de ${seconds} segundos e inicia um novo login apenas uma vez.`
+            );
+        }
+
+        pendingLogin.status = 'processing';
+        pendingDiscordLogins.set(requestId, pendingLogin);
 
         const tokenBody = new URLSearchParams({
             client_id: DISCORD_CLIENT_ID,
@@ -179,17 +316,14 @@ app.get('/api/discord/callback', async (req, res) => {
             redirect_uri: DISCORD_REDIRECT_URI
         });
 
-        const tokenResponse = await fetch(
-            'https://discord.com/api/oauth2/token',
-            {
-                method: 'POST',
-                headers: {
-                    Accept: 'application/json',
-                    'Content-Type': 'application/x-www-form-urlencoded'
-                },
-                body: tokenBody.toString()
-            }
-        );
+        const tokenResponse = await fetch(DISCORD_TOKEN_URL, {
+            method: 'POST',
+            headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/x-www-form-urlencoded'
+            },
+            body: tokenBody.toString()
+        });
 
         const tokenData = await readDiscordResponse(
             tokenResponse,
@@ -197,13 +331,17 @@ app.get('/api/discord/callback', async (req, res) => {
         );
 
         if (!tokenData.access_token) {
-            console.error(
-                'Token Discord sem access_token:',
-                tokenData
-            );
+            console.error('Token Discord sem access_token.');
 
-            return res.status(400).send(
-                'Não foi possível obter o token Discord.'
+            pendingLogin.status = 'pending';
+            pendingDiscordLogins.set(requestId, pendingLogin);
+
+            return sendHtmlPage(
+                res,
+                400,
+                'Token indisponível',
+                'Não foi possível obter o token Discord',
+                'Volta à aplicação e tenta novamente.'
             );
         }
 
@@ -212,15 +350,8 @@ app.get('/api/discord/callback', async (req, res) => {
             Authorization: 'Bearer ' + tokenData.access_token
         };
 
-        const userResponse = await fetch(
-            'https://discord.com/api/users/@me',
-            { headers }
-        );
-
-        const user = await readDiscordResponse(
-            userResponse,
-            'Perfil Discord'
-        );
+        const userResponse = await fetch(DISCORD_USER_URL, { headers });
+        const user = await readDiscordResponse(userResponse, 'Perfil Discord');
 
         const memberResponse = await fetch(
             'https://discord.com/api/users/@me/guilds/' +
@@ -242,8 +373,15 @@ app.get('/api/discord/callback', async (req, res) => {
                 body: body.substring(0, 1000)
             });
 
-            return res.status(403).send(
-                'Não tens acesso. Primeiro entra no servidor Discord oficial.'
+            pendingLogin.status = 'pending';
+            pendingDiscordLogins.set(requestId, pendingLogin);
+
+            return sendHtmlPage(
+                res,
+                403,
+                'Sem acesso ao servidor',
+                'Não tens acesso ao Discord oficial',
+                'Confirma que entraste no servidor Discord e volta à aplicação.'
             );
         }
 
@@ -257,8 +395,15 @@ app.get('/api/discord/callback', async (req, res) => {
             member.roles.includes(DISCORD_REQUIRED_ROLE_ID);
 
         if (!hasRequiredRole) {
-            return res.status(403).send(
-                'Não tens a role necessária no servidor Discord.'
+            pendingLogin.status = 'pending';
+            pendingDiscordLogins.set(requestId, pendingLogin);
+
+            return sendHtmlPage(
+                res,
+                403,
+                'Role necessária em falta',
+                'Não tens a role necessária no servidor Discord',
+                'Pede acesso ao administrador do servidor e volta à aplicação.'
             );
         }
 
@@ -266,33 +411,64 @@ app.get('/api/discord/callback', async (req, res) => {
             status: 'authorized',
             discordId: user.id,
             username: user.global_name || user.username,
-            expiresAt: Date.now() + (5 * 60 * 1000)
+            expiresAt: Date.now() + DISCORD_AUTHORIZED_EXPIRY_MS
         });
 
-        return res.send(`
-<!doctype html>
-<html lang="pt-PT">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Discord validado</title>
-</head>
-<body style="font-family: Arial, sans-serif; background: #111827; color: white; text-align: center; padding: 80px 20px;">
-    <h1>Discord validado com sucesso</h1>
-    <p>Podes fechar esta página e voltar à aplicação JonyOptimizer.</p>
-    <p>Utilizador: ${escapeHtml(user.global_name || user.username)}</p>
-</body>
-</html>
-`);
+        discordTokenCooldowns.delete(requestId);
+
+        return sendHtmlPage(
+            res,
+            200,
+            'Discord validado',
+            'Discord validado com sucesso',
+            `Podes fechar esta página e voltar à aplicação JonyOptimizer. Utilizador: ${user.global_name || user.username}`
+        );
     } catch (error) {
+        const status = error.status || 500;
+
         console.error('Erro Discord OAuth:', {
             message: error.message,
-            status: error.status || 500,
+            status,
+            retryAfterMs: error.retryAfterMs || 0,
             stack: error.stack
         });
 
-        return res.status(error.status || 500).send(
-            'Erro ao validar o Discord. Consulta os logs do servidor.'
+        if (requestId) {
+            const login = pendingDiscordLogins.get(requestId);
+
+            if (login && login.status === 'processing') {
+                login.status = 'pending';
+                pendingDiscordLogins.set(requestId, login);
+            }
+        }
+
+        if (status === 429) {
+            const waitMs = Math.max(
+                error.retryAfterMs || DISCORD_TOKEN_COOLDOWN_MS,
+                DISCORD_TOKEN_COOLDOWN_MS
+            );
+
+            if (requestId) {
+                discordTokenCooldowns.set(requestId, Date.now() + waitMs);
+            }
+
+            const seconds = Math.ceil(waitMs / 1000);
+
+            return sendHtmlPage(
+                res,
+                429,
+                'Pedido temporariamente limitado',
+                'O Discord limitou temporariamente os pedidos',
+                `Aguarda pelo menos ${seconds} segundos. Depois volta à aplicação e inicia apenas um novo login.`
+            );
+        }
+
+        return sendHtmlPage(
+            res,
+            status,
+            'Erro ao validar Discord',
+            'Erro ao validar o Discord',
+            'Consulta os logs do servidor ou volta à aplicação e tenta novamente mais tarde.'
         );
     }
 });
@@ -311,10 +487,28 @@ app.get('/api/discord/status/:requestId', (req, res) => {
 
     if (Date.now() > login.expiresAt) {
         pendingDiscordLogins.delete(requestId);
+        discordTokenCooldowns.delete(requestId);
 
         return res.json({
             success: false,
             status: 'expired'
+        });
+    }
+
+    const retryAfterMs = getRemainingCooldownMs(requestId);
+
+    if (retryAfterMs > 0) {
+        return res.json({
+            success: false,
+            status: 'rate_limited',
+            retry_after_seconds: Math.ceil(retryAfterMs / 1000)
+        });
+    }
+
+    if (login.status === 'processing') {
+        return res.json({
+            success: false,
+            status: 'processing'
         });
     }
 
